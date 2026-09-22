@@ -2,11 +2,10 @@
 #include <ATen/ATen.h>
 #include <torch/library.h>
 
-#include <algorithm>
 #include <cmath>
 #include <tuple>
 
-// Makes the .so importable as rmsnorm._C. the module itself is empty.
+// Makes the .so importable as rmsnorm._C. The module itself is empty.
 extern "C" {
 PyObject* PyInit__C(void) {
     static struct PyModuleDef module_def = {
@@ -16,22 +15,9 @@ PyObject* PyInit__C(void) {
 }
 }
 
-at::Tensor myrelu_cpu(const at::Tensor& x) {
-    TORCH_CHECK(x.device().is_cpu(), "myrelu: expected a CPU tensor, got ", x.device());
-    TORCH_CHECK(x.dtype() == at::kFloat, "myrelu: expected float32, got ", x.dtype());
-
-    at::Tensor xc = x.contiguous();
-    at::Tensor out = at::empty_like(xc);
-
-    const float* in = xc.const_data_ptr<float>();
-    float* dst = out.mutable_data_ptr<float>();
-
-    for (int64_t i = 0; i < xc.numel(); i++) {
-        dst[i] = std::max(in[i], 0.0f);
-    }
-    return out;
-}
-
+// With inv = 1/rms and xhat = x * inv, per row:
+//   grad_x = inv * (w*g - xhat * mean(w*g*xhat))
+//   grad_w = sum over rows of g*xhat
 template <typename T>
 void rmsnorm_bwd(const T* g, const T* x, const T* w, T* gx, T* gw, int64_t rows, int64_t n, double eps) {
     for (int64_t r = 0; r < rows; r++) {
@@ -46,7 +32,8 @@ void rmsnorm_bwd(const T* g, const T* x, const T* w, T* gx, T* gw, int64_t rows,
         }
         const double inv = 1.0 / std::sqrt(sum_sq / n + eps);
 
-        // Pass2: coupling su, and grad-weight accumulation.
+        // Pass 2: grad_weight accumulation and the coupling term. rms depends
+        // on every x in the row, so each grad_x[j] needs this row-wide sum.
         double dot = 0.0;
         for (int64_t j = 0; j < n; j++) {
             const double xhat = static_cast<double>(xr[j]) * inv;
@@ -55,7 +42,7 @@ void rmsnorm_bwd(const T* g, const T* x, const T* w, T* gx, T* gw, int64_t rows,
 
         }
 
-        // Pass3: grad_x.
+        // Pass 3: grad_x.
         for (int64_t j = 0; j < n; j++) {
             const double xhat = static_cast<double>(xr[j]) * inv;
             gxr[j] = static_cast<T>(inv * (static_cast<double>(w[j]) * gr[j] - xhat * dot / n));
@@ -63,6 +50,7 @@ void rmsnorm_bwd(const T* g, const T* x, const T* w, T* gx, T* gw, int64_t rows,
     }
 }
 
+// y = w * x / sqrt(mean(x^2) + eps), normalized over the last dimension.
 template <typename T>
 void rmsnorm_fwd(const T* x, const T* w, T* y, int64_t rows, int64_t n, double eps) {
     for (int64_t r = 0; r < rows; r++) {
@@ -127,6 +115,7 @@ std::tuple<at::Tensor, at::Tensor> rmsnorm_backward_cpu (const at::Tensor& grad_
     at::Tensor xc = x.contiguous();
     at::Tensor weightc = weight.contiguous();
     at::Tensor grad_x = at::empty_like(xc);
+    // Every row adds into grad_weight, so it must start at zero.
     at::Tensor grad_weight = at::zeros_like(weightc);
 
     const int64_t n = xc.size(-1);
@@ -141,14 +130,13 @@ std::tuple<at::Tensor, at::Tensor> rmsnorm_backward_cpu (const at::Tensor& grad_
     return {grad_x, grad_weight};
 }
 
+// The backward is a separate op so torch.compile can trace it.
 TORCH_LIBRARY(rmsnorm, m) {
-    m.def("myrelu(Tensor x) -> Tensor");
     m.def("rmsnorm(Tensor x, Tensor weight, float eps) -> Tensor");
     m.def("rmsnorm_backward(Tensor grad_out, Tensor x, Tensor weight, float eps) -> (Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(rmsnorm, CPU, m) {
-    m.impl("myrelu", &myrelu_cpu);
     m.impl("rmsnorm", &rmsnorm_cpu);
     m.impl("rmsnorm_backward", &rmsnorm_backward_cpu);
 }
