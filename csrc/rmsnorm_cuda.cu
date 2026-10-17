@@ -5,6 +5,7 @@
 #include <torch/library.h>
 
 #include <tuple>
+#include <algorithm>
 
 // Sum v over the whole block. Every thread receives the result.
 template <typename T>
@@ -56,6 +57,38 @@ __global__ void rmsnorm_fwd_kernel(const T* x, const T* w, T* y, int64_t n, T ep
     }
 }
 
+// Keeps each thread's elements in registers, so x is read only once.
+// Requires n <= kElemsPerThread * blockDim.x.
+template <typename T, int kElemsPerThread>
+__global__ void rmsnorm_fwd_cached_kernel(const T* x, const T* w, T* y, int64_t n, T eps) {
+    __shared__ T partial[32];
+    int64_t row = blockIdx.x;
+    const T* xr = x + row * n;
+    T* yr = y + row * n;
+
+    // Load this thread's elements once and sum their squares.
+    T xv[kElemsPerThread];
+    T s = 0;
+    #pragma unroll
+    for (int k = 0; k < kElemsPerThread; k++) {
+        int64_t j = threadIdx.x + k * blockDim.x;
+        xv[k] = j < n ? xr[j] : T(0);
+        s += xv[k] * xv[k];
+    }
+
+    // Reduce over the block and compute inv = 1 / rms.
+    T inv = rsqrt(block_sum(s, partial) / n + eps);
+
+    // Write the output from registers.
+    #pragma unroll
+    for (int k = 0; k < kElemsPerThread; k++) {
+        int64_t j = threadIdx.x + k * blockDim.x;
+        if (j < n) {
+            yr[j] = w[j] * xv[k] * inv;
+        }
+    }
+}
+
 template <typename T>
 __global__ void rmsnorm_bwd_kernel(const T* g, const T* x, const T* w,
                                    T* gx, T* gw_rows, int64_t n, T eps) {
@@ -90,6 +123,8 @@ __global__ void rmsnorm_bwd_kernel(const T* g, const T* x, const T* w,
 }
 
 constexpr int kThreadsPerRow = 256;
+constexpr int kElemsPerThread = 8;
+constexpr int kMaxThreads = 1024;
 
 at::Tensor rmsnorm_cuda(const at::Tensor& x, const at::Tensor& weight, double eps) {
     TORCH_CHECK(x.device().is_cuda(), "rmsnorm: expected x on CUDA, got ", x.device());
@@ -112,11 +147,25 @@ at::Tensor rmsnorm_cuda(const at::Tensor& x, const at::Tensor& weight, double ep
     const int64_t n = xc.size(-1);
     const int64_t rows = n == 0 ? 0 : xc.numel() / n;
     if (rows > 0) {
+        // Threads per row: enough for kElemsPerThread elements each,
+        // rounded up to a whole number of warps.
+        int64_t threads = (n + kElemsPerThread - 1) / kElemsPerThread;
+        threads = std::max<int64_t>(32, (threads + 31) / 32 * 32);
+        const bool fits = threads <= kMaxThreads;
+
         AT_DISPATCH_FLOATING_TYPES(xc.scalar_type(), "rmsnorm", [&] {
-            rmsnorm_fwd_kernel<scalar_t>
-                <<<rows, kThreadsPerRow, 0, at::cuda::getCurrentCUDAStream()>>>(
-                    xc.const_data_ptr<scalar_t>(), wc.const_data_ptr<scalar_t>(),
-                    out.mutable_data_ptr<scalar_t>(), n, static_cast<scalar_t>(eps));
+            auto stream = at::cuda::getCurrentCUDAStream();
+            if (fits) {
+                rmsnorm_fwd_cached_kernel<scalar_t, kElemsPerThread>
+                    <<<rows, threads, 0, stream>>>(
+                        xc.const_data_ptr<scalar_t>(), wc.const_data_ptr<scalar_t>(),
+                        out.mutable_data_ptr<scalar_t>(), n, static_cast<scalar_t>(eps));
+            } else {
+                rmsnorm_fwd_kernel<scalar_t>
+                    <<<rows, kThreadsPerRow, 0, stream>>>(
+                        xc.const_data_ptr<scalar_t>(), wc.const_data_ptr<scalar_t>(),
+                        out.mutable_data_ptr<scalar_t>(), n, static_cast<scalar_t>(eps));
+            }
             C10_CUDA_KERNEL_LAUNCH_CHECK();
         });
     }

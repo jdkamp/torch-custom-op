@@ -15,7 +15,7 @@ pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA not available"
 )
 
-SHAPES = [(8,), (4, 16), (3, 5, 512), (2, 4096), (0, 8), (3, 0)]
+SHAPES = [(8,), (4, 16), (3, 5, 512), (2, 4096), (0, 8), (3, 0), (5, 33), (2, 10000)]
 DTYPES = [torch.float32, torch.float64]
 
 

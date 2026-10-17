@@ -8,7 +8,7 @@ if CUDA_HOME is not None:
     ext = CUDAExtension(
         name="rmsnorm._C",
         sources = sources + ["csrc/rmsnorm_cuda.cu"],
-        extra_compile_args={"cxx": cxx_flags, "nvcc": ["-O3"]},
+        extra_compile_args={"cxx": cxx_flags, "nvcc": ["-O3", "-Xptxas", "-v"]},
     )
 else:
     ext = CppExtension(
