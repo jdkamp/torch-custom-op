@@ -69,7 +69,6 @@ __global__ void rmsnorm_fwd_cached_kernel(const T* x, const T* w, T* y, int64_t 
     // Load this thread's elements once and sum their squares.
     T xv[kElemsPerThread];
     T s = 0;
-    #pragma unroll
     for (int k = 0; k < kElemsPerThread; k++) {
         int64_t j = threadIdx.x + k * blockDim.x;
         xv[k] = j < n ? xr[j] : T(0);
@@ -80,7 +79,6 @@ __global__ void rmsnorm_fwd_cached_kernel(const T* x, const T* w, T* y, int64_t 
     T inv = rsqrt(block_sum(s, partial) / n + eps);
 
     // Write the output from registers.
-    #pragma unroll
     for (int k = 0; k < kElemsPerThread; k++) {
         int64_t j = threadIdx.x + k * blockDim.x;
         if (j < n) {
