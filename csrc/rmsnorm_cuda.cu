@@ -4,8 +4,8 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/library.h>
 
-#include <tuple>
 #include <algorithm>
+#include <tuple>
 
 // Sum v over the whole block. Every thread receives the result.
 template <typename T>
@@ -122,9 +122,66 @@ __global__ void rmsnorm_bwd_kernel(const T* g, const T* x, const T* w,
     }
 }
 
+template <typename T, int kElemsPerThread>
+__global__ void rmsnorm_bwd_cached_kernel(const T* g, const T* x, const T* w,
+                                          T* gx, T* gw_rows, int64_t n, T eps) {
+    __shared__ T partial[32];
+    int64_t row = blockIdx.x;
+    const T* gr = g + row * n;
+    const T* xr = x + row * n;
+    T* gxr = gx + row * n;
+    T* gwr = gw_rows + row * n;
+
+    T xv[kElemsPerThread];
+    T gv[kElemsPerThread];
+    T wv[kElemsPerThread];
+
+    // Pass 1: recompute inv = 1 / rms.
+    T s = 0;
+    #pragma unroll
+    for (int k = 0; k < kElemsPerThread; k++) {
+        int64_t j = threadIdx.x + k * blockDim.x;
+        bool in_row = j < n;
+        xv[k] = in_row ? xr[j] : T(0);
+        gv[k] = in_row ? gr[j] : T(0);
+        wv[k] = in_row ? w[j] : T(0);
+        s += xv[k] * xv[k];
+    }
+    T inv = rsqrt(block_sum(s, partial) / n + eps);
+
+    // Pass 2: grad_weight contribution and the coupling sum.
+    T d = 0;
+    #pragma unroll
+    for (int k = 0; k < kElemsPerThread; k++) {
+        int64_t j = threadIdx.x + k * blockDim.x;
+        T xhat = xv[k] * inv;
+        d += wv[k] * gv[k] * xhat;
+        if (j < n) {
+            gwr[j] = gv[k] * xhat;
+        }
+    }
+    T dot = block_sum(d, partial);
+
+    // Pass 3: grad_x.
+    #pragma unroll
+    for (int k = 0; k < kElemsPerThread; k++) {
+        int64_t j = threadIdx.x + k * blockDim.x;
+        T xhat = xv[k] * inv;
+        if (j < n) {
+            gxr[j] = inv * (wv[k] * gv[k] - xhat * dot / n);
+        }
+    }
+}
+
 constexpr int kThreadsPerRow = 256;
 constexpr int kElemsPerThread = 8;
 constexpr int kMaxThreads = 1024;
+
+int threads_per_row(int64_t n) {
+    int64_t threads = (n + kElemsPerThread - 1) / kElemsPerThread;
+    threads = (threads + 31) / 32 * 32;
+    return static_cast<int>(std::clamp<int64_t>(threads, 32, kMaxThreads));
+}
 
 at::Tensor rmsnorm_cuda(const at::Tensor& x, const at::Tensor& weight, double eps) {
     TORCH_CHECK(x.device().is_cuda(), "rmsnorm: expected x on CUDA, got ", x.device());
@@ -147,15 +204,12 @@ at::Tensor rmsnorm_cuda(const at::Tensor& x, const at::Tensor& weight, double ep
     const int64_t n = xc.size(-1);
     const int64_t rows = n == 0 ? 0 : xc.numel() / n;
     if (rows > 0) {
-        // Threads per row: enough for kElemsPerThread elements each,
-        // rounded up to a whole number of warps.
-        int64_t threads = (n + kElemsPerThread - 1) / kElemsPerThread;
-        threads = std::max<int64_t>(32, (threads + 31) / 32 * 32);
-        const bool fits = threads <= kMaxThreads;
+        const int threads = threads_per_row(n);
+        const bool cached = n <= static_cast<int64_t>(kElemsPerThread) * threads;
 
         AT_DISPATCH_FLOATING_TYPES(xc.scalar_type(), "rmsnorm", [&] {
             auto stream = at::cuda::getCurrentCUDAStream();
-            if (fits) {
+            if (cached) {
                 rmsnorm_fwd_cached_kernel<scalar_t, kElemsPerThread>
                     <<<rows, threads, 0, stream>>>(
                         xc.const_data_ptr<scalar_t>(), wc.const_data_ptr<scalar_t>(),
@@ -204,12 +258,24 @@ std::tuple<at::Tensor, at::Tensor> rmsnorm_backward_cuda(
     // One row of grad_weight contributions per input row, summed below.
     at::Tensor gw_rows = at::empty({rows, n}, xc.options());
     if (rows > 0) {
+        const int threads = threads_per_row(n);
+        const bool cached = n <= static_cast<int64_t>(kElemsPerThread) * threads;
+
         AT_DISPATCH_FLOATING_TYPES(xc.scalar_type(), "rmsnorm_backward", [&] {
-            rmsnorm_bwd_kernel<scalar_t>
-                <<<rows, kThreadsPerRow, 0, at::cuda::getCurrentCUDAStream()>>>(
-                    gc.const_data_ptr<scalar_t>(), xc.const_data_ptr<scalar_t>(),
-                    wc.const_data_ptr<scalar_t>(), grad_x.mutable_data_ptr<scalar_t>(),
-                    gw_rows.mutable_data_ptr<scalar_t>(), n, static_cast<scalar_t>(eps));
+            auto stream = at::cuda::getCurrentCUDAStream();
+            if (cached) {
+                rmsnorm_bwd_cached_kernel<scalar_t, kElemsPerThread>
+                    <<<rows, threads, 0, stream>>>(
+                        gc.const_data_ptr<scalar_t>(), xc.const_data_ptr<scalar_t>(),
+                        wc.const_data_ptr<scalar_t>(), grad_x.mutable_data_ptr<scalar_t>(),
+                        gw_rows.mutable_data_ptr<scalar_t>(), n, static_cast<scalar_t>(eps));
+            } else {
+                rmsnorm_bwd_kernel<scalar_t>
+                    <<<rows, kThreadsPerRow, 0, stream>>>(
+                        gc.const_data_ptr<scalar_t>(), xc.const_data_ptr<scalar_t>(),
+                        wc.const_data_ptr<scalar_t>(), grad_x.mutable_data_ptr<scalar_t>(),
+                        gw_rows.mutable_data_ptr<scalar_t>(), n, static_cast<scalar_t>(eps));
+            }
             C10_CUDA_KERNEL_LAUNCH_CHECK();
         });
     }
