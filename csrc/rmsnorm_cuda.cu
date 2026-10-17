@@ -4,8 +4,8 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/library.h>
 
-#include <tuple>
 #include <algorithm>
+#include <tuple>
 
 // Sum v over the whole block. Every thread receives the result.
 template <typename T>
@@ -122,9 +122,85 @@ __global__ void rmsnorm_bwd_kernel(const T* g, const T* x, const T* w,
     }
 }
 
+// Each block processes rows blockIdx.x, blockIdx.x + gridDim.x, ... and
+// accumulates their grad_weight contributions in registers, writing one row
+// of partial sums. Keeps x, g and w in registers, so each is read once.
+// Requires n <= kElemsPerThread * blockDim.x.
+template <typename T, int kElemsPerThread>
+__global__ void rmsnorm_bwd_cached_kernel(const T* g, const T* x, const T* w,
+                                          T* gx, T* gw_partial,
+                                          int64_t rows, int64_t n, T eps) {
+    __shared__ T partial[32];
+
+    // w is the same for every row, so load it once per block.
+    T wv[kElemsPerThread];
+    T gw_acc[kElemsPerThread];
+    #pragma unroll
+    for (int k = 0; k < kElemsPerThread; k++) {
+        int64_t j = threadIdx.x + k * blockDim.x;
+        wv[k] = j < n ? w[j] : T(0);
+        gw_acc[k] = 0;
+    }
+
+    for (int64_t row = blockIdx.x; row < rows; row += gridDim.x) {
+        const T* gr = g + row * n;
+        const T* xr = x + row * n;
+        T* gxr = gx + row * n;
+
+        // Pass 1: load x and g once and recompute inv = 1 / rms.
+        T xv[kElemsPerThread];
+        T gv[kElemsPerThread];
+        T s = 0;
+        #pragma unroll
+        for (int k = 0; k < kElemsPerThread; k++) {
+            int64_t j = threadIdx.x + k * blockDim.x;
+            bool in_row = j < n;
+            xv[k] = in_row ? xr[j] : T(0);
+            gv[k] = in_row ? gr[j] : T(0);
+            s += xv[k] * xv[k];
+        }
+        T inv = rsqrt(block_sum(s, partial) / n + eps);
+
+        // Pass 2: accumulate grad_weight and the coupling sum.
+        T d = 0;
+        #pragma unroll
+        for (int k = 0; k < kElemsPerThread; k++) {
+            T xhat = xv[k] * inv;
+            d += wv[k] * gv[k] * xhat;
+            gw_acc[k] += gv[k] * xhat;
+        }
+        T dot = block_sum(d, partial);
+
+        // Pass 3: grad_x, from registers.
+        #pragma unroll
+        for (int k = 0; k < kElemsPerThread; k++) {
+            int64_t j = threadIdx.x + k * blockDim.x;
+            if (j < n) {
+                T xhat = xv[k] * inv;
+                gxr[j] = inv * (wv[k] * gv[k] - xhat * dot / n);
+            }
+        }
+    }
+
+    // One row of partial grad_weight sums per block.
+    #pragma unroll
+    for (int k = 0; k < kElemsPerThread; k++) {
+        int64_t j = threadIdx.x + k * blockDim.x;
+        if (j < n) {
+            gw_partial[blockIdx.x * n + j] = gw_acc[k];
+        }
+    }
+}
+
 constexpr int kThreadsPerRow = 256;
 constexpr int kElemsPerThread = 8;
 constexpr int kMaxThreads = 1024;
+
+int threads_per_row(int64_t n) {
+    int64_t threads = (n + kElemsPerThread - 1) / kElemsPerThread;
+    threads = (threads + 31) / 32 * 32;
+    return static_cast<int>(std::clamp<int64_t>(threads, 32, kMaxThreads));
+}
 
 at::Tensor rmsnorm_cuda(const at::Tensor& x, const at::Tensor& weight, double eps) {
     TORCH_CHECK(x.device().is_cuda(), "rmsnorm: expected x on CUDA, got ", x.device());
@@ -147,15 +223,12 @@ at::Tensor rmsnorm_cuda(const at::Tensor& x, const at::Tensor& weight, double ep
     const int64_t n = xc.size(-1);
     const int64_t rows = n == 0 ? 0 : xc.numel() / n;
     if (rows > 0) {
-        // Threads per row: enough for kElemsPerThread elements each,
-        // rounded up to a whole number of warps.
-        int64_t threads = (n + kElemsPerThread - 1) / kElemsPerThread;
-        threads = std::max<int64_t>(32, (threads + 31) / 32 * 32);
-        const bool fits = threads <= kMaxThreads;
+        const int threads = threads_per_row(n);
+        const bool cached = n <= static_cast<int64_t>(kElemsPerThread) * threads;
 
         AT_DISPATCH_FLOATING_TYPES(xc.scalar_type(), "rmsnorm", [&] {
             auto stream = at::cuda::getCurrentCUDAStream();
-            if (fits) {
+            if (cached) {
                 rmsnorm_fwd_cached_kernel<scalar_t, kElemsPerThread>
                     <<<rows, threads, 0, stream>>>(
                         xc.const_data_ptr<scalar_t>(), wc.const_data_ptr<scalar_t>(),
@@ -173,8 +246,8 @@ at::Tensor rmsnorm_cuda(const at::Tensor& x, const at::Tensor& weight, double ep
     return out;
 }
 
-std::tuple<at::Tensor, at::Tensor> rmsnorm_backward_cuda(
-    const at::Tensor& grad_out, const at::Tensor& x, const at::Tensor& weight, double eps) {
+std::tuple<at::Tensor, at::Tensor> rmsnorm_backward_cuda(const at::Tensor& grad_out, const at::Tensor& x, 
+                                                         const at::Tensor& weight, double eps) {
     TORCH_CHECK(x.is_cuda(), "rmsnorm_backward: expected x on CUDA, got ", x.device());
     TORCH_CHECK(grad_out.device() == x.device() && weight.device() == x.device(),
                 "rmsnorm_backward: all tensors must be on the same device, got grad_out on ",
@@ -201,19 +274,45 @@ std::tuple<at::Tensor, at::Tensor> rmsnorm_backward_cuda(
     const int64_t rows = n == 0 ? 0 : xc.numel() / n;
 
     at::Tensor grad_x = at::empty_like(xc);
-    // One row of grad_weight contributions per input row, summed below.
-    at::Tensor gw_rows = at::empty({rows, n}, xc.options());
+    // Partial grad_weight sums, one row per block (or per input row in the
+    // non cached), summed below. Empty when there are no rows.
+    at::Tensor gw_partial = at::empty({0, n}, xc.options());
+
     if (rows > 0) {
-        AT_DISPATCH_FLOATING_TYPES(xc.scalar_type(), "rmsnorm_backward", [&] {
-            rmsnorm_bwd_kernel<scalar_t>
-                <<<rows, kThreadsPerRow, 0, at::cuda::getCurrentCUDAStream()>>>(
-                    gc.const_data_ptr<scalar_t>(), xc.const_data_ptr<scalar_t>(),
-                    wc.const_data_ptr<scalar_t>(), grad_x.mutable_data_ptr<scalar_t>(),
-                    gw_rows.mutable_data_ptr<scalar_t>(), n, static_cast<scalar_t>(eps));
-            C10_CUDA_KERNEL_LAUNCH_CHECK();
-        });
+        const int threads = threads_per_row(n);
+        const bool cached = n <= static_cast<int64_t>(kElemsPerThread) * threads;
+
+        if (cached) {
+            // Enough blocks to fill the GPU once, each block loops over many rows.
+            const int sm_count = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+            const int blocks_per_sm = std::max(1, kMaxThreads / threads);
+            const int64_t blocks = std::min<int64_t>(rows, sm_count * blocks_per_sm);
+            gw_partial = at::empty({blocks, n}, xc.options());
+
+            AT_DISPATCH_FLOATING_TYPES(xc.scalar_type(), "rmsnorm_backward", [&] {
+                rmsnorm_bwd_cached_kernel<scalar_t, kElemsPerThread>
+                    <<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+                        gc.const_data_ptr<scalar_t>(), xc.const_data_ptr<scalar_t>(),
+                        wc.const_data_ptr<scalar_t>(), grad_x.mutable_data_ptr<scalar_t>(),
+                        gw_partial.mutable_data_ptr<scalar_t>(),
+                        rows, n, static_cast<scalar_t>(eps));
+                C10_CUDA_KERNEL_LAUNCH_CHECK();
+            });
+        } else {
+            gw_partial = at::empty({rows, n}, xc.options());
+
+            AT_DISPATCH_FLOATING_TYPES(xc.scalar_type(), "rmsnorm_backward", [&] {
+                rmsnorm_bwd_kernel<scalar_t>
+                    <<<rows, kThreadsPerRow, 0, at::cuda::getCurrentCUDAStream()>>>(
+                        gc.const_data_ptr<scalar_t>(), xc.const_data_ptr<scalar_t>(),
+                        wc.const_data_ptr<scalar_t>(), grad_x.mutable_data_ptr<scalar_t>(),
+                        gw_partial.mutable_data_ptr<scalar_t>(),
+                        n, static_cast<scalar_t>(eps));
+                C10_CUDA_KERNEL_LAUNCH_CHECK();
+            });
+        }
     }
-    return {grad_x, gw_rows.sum(0)};
+    return {grad_x, gw_partial.sum(0)};
 }
 
 TORCH_LIBRARY_IMPL(rmsnorm, CUDA, m) {
