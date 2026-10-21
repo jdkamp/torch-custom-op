@@ -27,6 +27,26 @@ y = torch.ops.rmsnorm.rmsnorm(x, weight, 1e-6)
 - Autograd is registered with `register_autograd`. The backward is its own dispatcher op, so `torch.compile` can trace it.
 - Both ops have fake kernels. `opcheck` passes for both.
 
+## Benchmark
+
+NVIDIA T4, float32, input (8192, 4096), median of `torch.utils.benchmark.Timer`.
+Reproduce with `python bench/bench.py`.
+
+| | Forward | Forward + backward |
+|---|---|---|
+| Naive eager PyTorch | 3.91 ms | 16.80 ms |
+| `F.rms_norm` | 1.65 ms | 5.42 ms |
+| `torch.compile` (naive) | 1.14 ms | 2.87 ms |
+| **This op** | **1.14 ms** | **3.85 ms** |
+
+The runtime was improved by the following measures:
+
+- Register caching: each thread keeps its slice of the row in registers, so
+  every input is read from memory only once.
+- Two-stage reduction for `grad_weight`: each block sums many rows in
+  registers before writing, instead of writing a buffer as large as the input.
+
+
 ## Tests
 
 ```bash
