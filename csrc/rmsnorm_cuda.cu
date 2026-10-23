@@ -283,19 +283,25 @@ std::tuple<at::Tensor, at::Tensor> rmsnorm_backward_cuda(const at::Tensor& grad_
         const bool cached = n <= static_cast<int64_t>(kElemsPerThread) * threads;
 
         if (cached) {
-            // Enough blocks to fill the GPU once, each block loops over many rows.
             const int sm_count = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
-            const int blocks_per_sm = std::max(1, kMaxThreads / threads);
-            const int64_t blocks = std::min<int64_t>(rows, sm_count * blocks_per_sm);
-            gw_partial = at::empty({blocks, n}, xc.options());
 
             AT_DISPATCH_FLOATING_TYPES(xc.scalar_type(), "rmsnorm_backward", [&] {
-                rmsnorm_bwd_cached_kernel<scalar_t, kElemsPerThread>
-                    <<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
-                        gc.const_data_ptr<scalar_t>(), xc.const_data_ptr<scalar_t>(),
-                        wc.const_data_ptr<scalar_t>(), grad_x.mutable_data_ptr<scalar_t>(),
-                        gw_partial.mutable_data_ptr<scalar_t>(),
-                        rows, n, static_cast<scalar_t>(eps));
+                auto kernel = rmsnorm_bwd_cached_kernel<scalar_t, kElemsPerThread>;
+
+                // As many blocks as fit on the GPU at once, given this kernel's
+                // register and thread usage; each block loops over many rows.
+                int blocks_per_sm = 0;
+                C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                    &blocks_per_sm, kernel, threads, 0));
+                const int64_t blocks = std::min<int64_t>(
+                    rows, static_cast<int64_t>(sm_count) * std::max(1, blocks_per_sm));
+                gw_partial = at::empty({blocks, n}, xc.options());
+
+                kernel<<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+                    gc.const_data_ptr<scalar_t>(), xc.const_data_ptr<scalar_t>(),
+                    wc.const_data_ptr<scalar_t>(), grad_x.mutable_data_ptr<scalar_t>(),
+                    gw_partial.mutable_data_ptr<scalar_t>(),
+                    rows, n, static_cast<scalar_t>(eps));
                 C10_CUDA_KERNEL_LAUNCH_CHECK();
             });
         } else {
