@@ -23,7 +23,8 @@ y = torch.ops.rmsnorm.rmsnorm(x, weight, 1e-6)
 ## Integration
 
 - `rmsnorm` and `rmsnorm_backward` are dispatcher ops with CPU and CUDA kernels.
-- The CUDA kernel uses one block of 256 threads per row. Row sums are reduced with warp shuffles, then across warps with shared memory.
+- The CUDA kernels size the block to the row: each thread handles 8 elements, so a row of `n` elements gets `ceil(n / 8)` threads, rounded up to a multiple of 32 and capped at 1024. Row sums are reduced with warp shuffles, then across warps with shared memory.
+- Rows longer than 8192 elements, or blocks too large for a kernel's register usage, fall back to a kernel with 256 threads per row that reads the row from memory in each pass.
 - Autograd is registered with `register_autograd`. The backward is its own dispatcher op, so `torch.compile` can trace it.
 - Both ops have fake kernels. `opcheck` passes for both.
 
@@ -34,18 +35,15 @@ Reproduce with `python bench/bench.py`.
 
 | | Forward | Forward + backward |
 |---|---|---|
-| Naive eager PyTorch | 3.91 ms | 16.80 ms |
-| `F.rms_norm` | 1.65 ms | 5.42 ms |
-| `torch.compile` (naive) | 1.14 ms | 2.87 ms |
-| **This op** | **1.14 ms** | **3.85 ms** |
+| Naive eager PyTorch     | 3.91 ms     | 16.80 ms |
+| `F.rms_norm`            | 1.65 ms     | 5.42 ms |
+| `torch.compile` (naive) | 1.14 ms     | 2.87 ms |
+| **This op**             | **1.14 ms** | **2.76 ms** |
 
 The runtime was improved by the following measures:
 
-- Register caching: each thread keeps its slice of the row in registers, so
-  every input is read from memory only once.
-- Two-stage reduction for `grad_weight`: each block sums many rows in
-  registers before writing, instead of writing a buffer as large as the input.
-
+- Register caching: each thread keeps its slice of the row in registers, so every input is read from memory only once.
+- Two-stage reduction for `grad_weight`: the backward launches as many blocks as fit on the GPU at once. Each block sums many rows in registers and writes one row of partial sums, which are then summed into the final gradient.
 
 ## Tests
 
@@ -59,5 +57,4 @@ python -m pytest tests
 ## Limitations
 
 - float32 and float64 only.
-- The CUDA kernel always uses 256 threads per row, which may waste threads for short rows.
 - The backward always computes both gradients; unneeded ones are not skipped.
