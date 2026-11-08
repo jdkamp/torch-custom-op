@@ -15,7 +15,14 @@ pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA not available"
 )
 
-SHAPES = [(8,), (4, 16), (3, 5, 512), (2, 4096), (0, 8), (3, 0), (5, 33), (2, 10000)]
+SHAPES = [
+    (8,), (4, 16), (3, 5, 512), (2, 4096), (0, 8), (3, 0), (5, 33), (2, 10000),
+    # Large cached rows: blocks of 768 and 1024 threads, more than the
+    # register-heavy backward kernel can launch with.
+    (3, 6000), (2, 8192),
+    # More rows than blocks, so each block of the cached backward loops over several rows.
+    (4096, 128),
+]
 DTYPES = [torch.float32, torch.float64]
 
 
@@ -70,7 +77,10 @@ def test_backward_matches_cpu(shape, dtype):
     expected_gx, expected_gw = op_backward(g, x, w, EPS)
     gx, gw = op_backward(g.cuda(), x.cuda(), w.cuda(), EPS)
     torch.testing.assert_close(gx.cpu(), expected_gx)
-    torch.testing.assert_close(gw.cpu(), expected_gw)
+    # grad_weight sums over all rows, and the GPU adds them in a different
+    # order than the CPU, so float32 rounding grows with the row count.
+    gw_tol = {"rtol": 1e-4, "atol": 1e-3} if dtype == torch.float32 else {}
+    torch.testing.assert_close(gw.cpu(), expected_gw, **gw_tol)
 
 
 @pytest.mark.parametrize("shape", [(8,), (3, 8), (2, 4, 16)])

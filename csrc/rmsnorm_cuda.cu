@@ -7,14 +7,24 @@
 #include <algorithm>
 #include <tuple>
 
+constexpr int kWarpSize = 32;
+constexpr int kMaxThreads = 1024;
+constexpr int kMaxWarps = kMaxThreads / kWarpSize;
+constexpr int kThreadsPerRow = 256;
+constexpr int kElemsPerThread = 8;
+
+// block_sum reduces the per-warp sums inside a single warp.
+static_assert(kMaxWarps <= kWarpSize, "per-warp sums must fit in one warp");
+
 // Sum v over the whole block. Every thread receives the result.
+// partial must hold kMaxWarps values.
 template <typename T>
 __device__ T block_sum(T v, T* partial) {
-    int lane = threadIdx.x % 32;
-    int warp = threadIdx.x / 32;
+    int lane = threadIdx.x % kWarpSize;
+    int warp = threadIdx.x / kWarpSize;
 
     // Reduce within each warp.
-    for (int offset = 16; offset > 0; offset /= 2) {
+    for (int offset = kWarpSize / 2; offset > 0; offset /= 2) {
         v += __shfl_xor_sync(0xffffffff, v, offset);
     }
     if (lane == 0) {
@@ -23,9 +33,9 @@ __device__ T block_sum(T v, T* partial) {
     __syncthreads();
 
     // Reduce across warps.
-    int num_warps = (blockDim.x + 31) / 32;
+    int num_warps = (blockDim.x + kWarpSize - 1) / kWarpSize;
     v = lane < num_warps ? partial[lane] : T(0);
-    for (int offset = 16; offset > 0; offset /= 2) {
+    for (int offset = kWarpSize / 2; offset > 0; offset /= 2) {
         v += __shfl_xor_sync(0xffffffff, v, offset);
     }
 
@@ -37,7 +47,7 @@ __device__ T block_sum(T v, T* partial) {
 
 template <typename T>
 __global__ void rmsnorm_fwd_kernel(const T* x, const T* w, T* y, int64_t n, T eps) {
-    __shared__ T partial[32];
+    __shared__ T partial[kMaxWarps];
     int64_t row = blockIdx.x;
     const T* xr = x + row * n;
     T* yr = y + row * n;
@@ -61,7 +71,7 @@ __global__ void rmsnorm_fwd_kernel(const T* x, const T* w, T* y, int64_t n, T ep
 // Requires n <= kElemsPerThread * blockDim.x.
 template <typename T, int kElemsPerThread>
 __global__ void rmsnorm_fwd_cached_kernel(const T* x, const T* w, T* y, int64_t n, T eps) {
-    __shared__ T partial[32];
+    __shared__ T partial[kMaxWarps];
     int64_t row = blockIdx.x;
     const T* xr = x + row * n;
     T* yr = y + row * n;
@@ -92,7 +102,7 @@ __global__ void rmsnorm_fwd_cached_kernel(const T* x, const T* w, T* y, int64_t 
 template <typename T>
 __global__ void rmsnorm_bwd_kernel(const T* g, const T* x, const T* w,
                                    T* gx, T* gw_rows, int64_t n, T eps) {
-    __shared__ T partial[32];
+    __shared__ T partial[kMaxWarps];
     int64_t row = blockIdx.x;
     const T* gr = g + row * n;
     const T* xr = x + row * n;
@@ -130,7 +140,7 @@ template <typename T, int kElemsPerThread>
 __global__ void rmsnorm_bwd_cached_kernel(const T* g, const T* x, const T* w,
                                           T* gx, T* gw_partial,
                                           int64_t rows, int64_t n, T eps) {
-    __shared__ T partial[32];
+    __shared__ T partial[kMaxWarps];
 
     // w is the same for every row, so load it once per block.
     T wv[kElemsPerThread];
@@ -192,14 +202,19 @@ __global__ void rmsnorm_bwd_cached_kernel(const T* g, const T* x, const T* w,
     }
 }
 
-constexpr int kThreadsPerRow = 256;
-constexpr int kElemsPerThread = 8;
-constexpr int kMaxThreads = 1024;
-
 int threads_per_row(int64_t n) {
     int64_t threads = (n + kElemsPerThread - 1) / kElemsPerThread;
-    threads = (threads + 31) / 32 * 32;
-    return static_cast<int>(std::clamp<int64_t>(threads, 32, kMaxThreads));
+    threads = (threads + kWarpSize - 1) / kWarpSize * kWarpSize;
+    return static_cast<int>(std::clamp<int64_t>(threads, kWarpSize, kMaxThreads));
+}
+
+// Largest block size the kernel can be launched with. A kernel that uses many
+// registers per thread can't use the full 1024 threads.
+template <typename Kernel>
+int max_threads_per_block(Kernel kernel) {
+    cudaFuncAttributes attr;
+    C10_CUDA_CHECK(cudaFuncGetAttributes(&attr, kernel));
+    return attr.maxThreadsPerBlock;
 }
 
 at::Tensor rmsnorm_cuda(const at::Tensor& x, const at::Tensor& weight, double eps) {
@@ -224,13 +239,18 @@ at::Tensor rmsnorm_cuda(const at::Tensor& x, const at::Tensor& weight, double ep
     const int64_t rows = n == 0 ? 0 : xc.numel() / n;
     if (rows > 0) {
         const int threads = threads_per_row(n);
-        const bool cached = n <= static_cast<int64_t>(kElemsPerThread) * threads;
 
         AT_DISPATCH_FLOATING_TYPES(xc.scalar_type(), "rmsnorm", [&] {
             auto stream = at::cuda::getCurrentCUDAStream();
+            auto cached_kernel = rmsnorm_fwd_cached_kernel<scalar_t, kElemsPerThread>;
+
+            // The cached kernel needs the whole row in registers, and a block
+            // small enough for its register usage.
+            const bool cached = n <= static_cast<int64_t>(kElemsPerThread) * threads &&
+                                threads <= max_threads_per_block(cached_kernel);
+
             if (cached) {
-                rmsnorm_fwd_cached_kernel<scalar_t, kElemsPerThread>
-                    <<<rows, threads, 0, stream>>>(
+                cached_kernel<<<rows, threads, 0, stream>>>(
                         xc.const_data_ptr<scalar_t>(), wc.const_data_ptr<scalar_t>(),
                         out.mutable_data_ptr<scalar_t>(), n, static_cast<scalar_t>(eps));
             } else {
@@ -280,43 +300,46 @@ std::tuple<at::Tensor, at::Tensor> rmsnorm_backward_cuda(const at::Tensor& grad_
 
     if (rows > 0) {
         const int threads = threads_per_row(n);
-        const bool cached = n <= static_cast<int64_t>(kElemsPerThread) * threads;
 
-        if (cached) {
-            const int sm_count = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+        AT_DISPATCH_FLOATING_TYPES(xc.scalar_type(), "rmsnorm_backward", [&] {
+            auto stream = at::cuda::getCurrentCUDAStream();
+            auto cached_kernel = rmsnorm_bwd_cached_kernel<scalar_t, kElemsPerThread>;
 
-            AT_DISPATCH_FLOATING_TYPES(xc.scalar_type(), "rmsnorm_backward", [&] {
-                auto kernel = rmsnorm_bwd_cached_kernel<scalar_t, kElemsPerThread>;
+            // The cached kernel needs the whole row in registers, and a block
+            // small enough for its register usage.
+            const bool cached = n <= static_cast<int64_t>(kElemsPerThread) * threads &&
+                                threads <= max_threads_per_block(cached_kernel);
 
+            if (cached) {
                 // As many blocks as fit on the GPU at once, given this kernel's
                 // register and thread usage, each block loops over many rows.
+                const int sm_count = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
                 int blocks_per_sm = 0;
                 C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                    &blocks_per_sm, kernel, threads, 0));
+                    &blocks_per_sm, cached_kernel, threads, 0));
+                TORCH_INTERNAL_ASSERT(blocks_per_sm > 0,
+                                      "rmsnorm_backward: cached kernel does not fit on an SM with ",
+                                      threads, " threads");
                 const int64_t blocks = std::min<int64_t>(
-                    rows, static_cast<int64_t>(sm_count) * std::max(1, blocks_per_sm));
+                    rows, static_cast<int64_t>(sm_count) * blocks_per_sm);
                 gw_partial = at::empty({blocks, n}, xc.options());
 
-                kernel<<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+                cached_kernel<<<blocks, threads, 0, stream>>>(
                     gc.const_data_ptr<scalar_t>(), xc.const_data_ptr<scalar_t>(),
                     wc.const_data_ptr<scalar_t>(), grad_x.mutable_data_ptr<scalar_t>(),
                     gw_partial.mutable_data_ptr<scalar_t>(),
                     rows, n, static_cast<scalar_t>(eps));
-                C10_CUDA_KERNEL_LAUNCH_CHECK();
-            });
-        } else {
-            gw_partial = at::empty({rows, n}, xc.options());
+            } else {
+                gw_partial = at::empty({rows, n}, xc.options());
 
-            AT_DISPATCH_FLOATING_TYPES(xc.scalar_type(), "rmsnorm_backward", [&] {
-                rmsnorm_bwd_kernel<scalar_t>
-                    <<<rows, kThreadsPerRow, 0, at::cuda::getCurrentCUDAStream()>>>(
-                        gc.const_data_ptr<scalar_t>(), xc.const_data_ptr<scalar_t>(),
-                        wc.const_data_ptr<scalar_t>(), grad_x.mutable_data_ptr<scalar_t>(),
-                        gw_partial.mutable_data_ptr<scalar_t>(),
-                        n, static_cast<scalar_t>(eps));
-                C10_CUDA_KERNEL_LAUNCH_CHECK();
-            });
-        }
+                rmsnorm_bwd_kernel<scalar_t><<<rows, kThreadsPerRow, 0, stream>>>(
+                    gc.const_data_ptr<scalar_t>(), xc.const_data_ptr<scalar_t>(),
+                    wc.const_data_ptr<scalar_t>(), grad_x.mutable_data_ptr<scalar_t>(),
+                    gw_partial.mutable_data_ptr<scalar_t>(),
+                    n, static_cast<scalar_t>(eps));
+            }
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+        });
     }
     return {grad_x, gw_partial.sum(0)};
 }
