@@ -18,9 +18,9 @@ def measure(fn):
     return timer.blocked_autorange(min_run_time=1.0).median
 
 
-def bench_forward(device, rows, n):
-    x = torch.randn(rows, n, device=device)
-    w = torch.randn(n, device=device)
+def bench_forward(device, rows, n, dtype):
+    x = torch.randn(rows, n, device=device, dtype=dtype)
+    w = torch.randn(n, device=device, dtype=dtype)
     compiled_naive = torch.compile(naive)
 
     variants = {
@@ -37,10 +37,10 @@ def bench_forward(device, rows, n):
         print(f"{label:22s} {seconds * 1e3:8.3f} ms")
 
 
-def bench_backward(device, rows, n):
-    x = torch.randn(rows, n, device=device, requires_grad=True)
-    w = torch.randn(n, device=device, requires_grad=True)
-    g = torch.randn(rows, n, device=device)
+def bench_backward(device, rows, n, dtype):
+    x = torch.randn(rows, n, device=device, requires_grad=True, dtype=dtype)
+    w = torch.randn(n, device=device, requires_grad=True, dtype=dtype)
+    g = torch.randn(rows, n, device=device, dtype=dtype)
     compiled_naive = torch.compile(naive)
 
     forwards = {
@@ -64,10 +64,11 @@ def main():
     rows, n = 8192, 4096
 
     name = torch.cuda.get_device_name() if device == "cuda" else "cpu"
-    print(f"{name}, shape ({rows}, {n}), torch.float32")
 
-    bench_forward(device, rows, n)
-    bench_backward(device, rows, n)
+    for dtype in [torch.float32, torch.float16]:
+        print(f"{name}, shape ({rows}, {n}), {dtype}")
+        bench_forward(device, rows, n, dtype)
+        bench_backward(device, rows, n, dtype)
 
 
 if __name__ == "__main__":

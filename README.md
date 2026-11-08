@@ -27,18 +27,32 @@ y = torch.ops.rmsnorm.rmsnorm(x, weight, 1e-6)
 - Rows longer than 8192 elements, or blocks too large for a kernel's register usage, fall back to a kernel with 256 threads per row that reads the row from memory in each pass.
 - Autograd is registered with `register_autograd`. The backward is its own dispatcher op, so `torch.compile` can trace it.
 - Both ops have fake kernels. `opcheck` passes for both.
+- Supported dtypes are float32, float64, float16 and bfloat16. For float16 and bfloat16 the kernels load and store in the input dtype but compute in higher precision (float32 on CUDA, float64 on CPU).
 
 ## Benchmark
 
-NVIDIA T4, float32, input (8192, 4096), median of `torch.utils.benchmark.Timer`.
-Reproduce with `python bench/bench.py`.
+NVIDIA T4, input (8192, 4096), median of `torch.utils.benchmark.Timer`.
+Reproduce with `python bench/bench.py`. `x.clone()` reads and writes the input once, so it is the reference for the forward.
+
+**float32**
 
 | | Forward | Forward + backward |
 |---|---|---|
-| Naive eager PyTorch     | 3.91 ms     | 16.80 ms |
-| `F.rms_norm`            | 1.65 ms     | 5.42 ms |
-| `torch.compile` (naive) | 1.14 ms     | 2.87 ms |
-| **This op**             | **1.14 ms** | **2.76 ms** |
+| `x.clone()` (reference)   | 1.15 ms     | |
+| Naive eager PyTorch       | 3.90 ms     | 16.74 ms |
+| `F.rms_norm`              | 1.64 ms     | 5.42 ms |
+| `torch.compile` (naive)   | 1.14 ms     | 2.87 ms |
+| **This op**               | **1.14 ms** | **2.75 ms** |
+
+**float16**
+
+| | Forward | Forward + backward |
+|---|---|---|
+| `x.clone()` (reference)   | 0.57 ms     | |
+| Naive eager PyTorch       | 2.24 ms     | 8.77 ms |
+| `F.rms_norm`              | 0.74 ms     | 2.70 ms |
+| `torch.compile` (naive)   | 0.54 ms     | 1.45 ms |
+| **This op**               | **0.65 ms** | **1.79 ms** |
 
 The runtime was improved by the following measures:
 
@@ -56,5 +70,5 @@ python -m pytest tests
 
 ## Limitations
 
-- float32 and float64 only.
+- In float16 the op is slower than `torch.compile`. The kernels load one element per thread at a time, which likely uses memory bandwidth less well for 2-byte types. Vectorized loads are not implemented yet.
 - The backward always computes both gradients; unneeded ones are not skipped.
