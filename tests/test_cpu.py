@@ -11,6 +11,7 @@ EPS = 1e-6
 
 SHAPES = [(8,), (4, 16), (3, 5, 512), (2, 4096), (0, 8), (3, 0)]
 DTYPES = [torch.float32, torch.float64]
+HALF_DTYPES = [torch.float16, torch.bfloat16]
 
 
 # Forward correctness
@@ -21,6 +22,16 @@ def test_matches_reference(shape, dtype):
     x = torch.randn(shape, dtype=dtype)
     w = torch.randn(shape[-1], dtype=dtype)
     torch.testing.assert_close(op(x, w, EPS), F.rms_norm(x, (shape[-1],), w, EPS))
+
+
+@pytest.mark.parametrize("dtype", HALF_DTYPES)
+@pytest.mark.parametrize("shape", SHAPES)
+def test_matches_reference_half(shape, dtype):
+    x = torch.randn(shape, dtype=dtype)
+    w = torch.randn(shape[-1], dtype=dtype)
+    # Reference in float32, rounded once at the end like the op.
+    expected = F.rms_norm(x.float(), (shape[-1],), w.float(), EPS).to(dtype)
+    torch.testing.assert_close(op(x, w, EPS), expected)
 
 
 def test_non_contiguous_input():
@@ -46,6 +57,24 @@ def test_invalid_inputs(x, w, match):
 
 # Backward correctness
 
+# The many-rows shape checks that grad_weight is summed without precision loss.
+@pytest.mark.parametrize("dtype", DTYPES + HALF_DTYPES)
+@pytest.mark.parametrize("shape", SHAPES + [(256, 64)])
+def test_backward_matches_reference(shape, dtype):
+    g = torch.randn(shape, dtype=dtype)
+    x = torch.randn(shape, dtype=dtype)
+    w = torch.randn(shape[-1], dtype=dtype)
+
+    # Reference: autograd through F.rms_norm in float64, rounded once at the end.
+    x64 = x.double().requires_grad_()
+    w64 = w.double().requires_grad_()
+    F.rms_norm(x64, (shape[-1],), w64, EPS).backward(g.double())
+
+    gx, gw = op_backward(g, x, w, EPS)
+    torch.testing.assert_close(gx, x64.grad.to(dtype))
+    torch.testing.assert_close(gw, w64.grad.to(dtype))
+
+
 @pytest.mark.parametrize("shape", [(8,), (3, 8), (2, 4, 16)])
 def test_gradcheck(shape):
     x = torch.randn(shape, dtype=torch.float64, requires_grad=True)
@@ -64,7 +93,7 @@ def test_partial_grad(which):
 
 # opcheck
 
-@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("dtype", DTYPES + HALF_DTYPES)
 @pytest.mark.parametrize("shape", [(8,), (3, 8), (2, 4, 16)])
 @pytest.mark.parametrize("requires_grad", [False, True])
 def test_opcheck_forward(shape, dtype, requires_grad):
@@ -73,7 +102,7 @@ def test_opcheck_forward(shape, dtype, requires_grad):
     torch.library.opcheck(op.default, (x, w, EPS))
 
 
-@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("dtype", DTYPES + HALF_DTYPES)
 @pytest.mark.parametrize("shape", [(8,), (3, 8), (2, 4, 16)])
 def test_opcheck_backward(shape, dtype):
     g = torch.randn(shape, dtype=dtype)

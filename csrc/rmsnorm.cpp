@@ -19,7 +19,7 @@ PyObject* PyInit__C(void) {
 //   grad_x = inv * (w*g - xhat * mean(w*g*xhat))
 //   grad_w = sum over rows of g*xhat
 template <typename T>
-void rmsnorm_bwd(const T* g, const T* x, const T* w, T* gx, T* gw, int64_t rows, int64_t n, double eps) {
+void rmsnorm_bwd(const T* g, const T* x, const T* w, T* gx, double* gw, int64_t rows, int64_t n, double eps) {
     for (int64_t r = 0; r < rows; r++) {
         const T* gr = g + r * n;
         const T* xr = x + r * n;
@@ -38,8 +38,7 @@ void rmsnorm_bwd(const T* g, const T* x, const T* w, T* gx, T* gw, int64_t rows,
         for (int64_t j = 0; j < n; j++) {
             const double xhat = static_cast<double>(xr[j]) * inv;
             dot += static_cast<double>(w[j]) * gr[j] * xhat;
-            gw[j] += static_cast<T>(static_cast<double>(gr[j]) * xhat);
-
+            gw[j] += static_cast<double>(gr[j]) * xhat;
         }
 
         // Pass 3: grad_x.
@@ -61,10 +60,10 @@ void rmsnorm_fwd(const T* x, const T* w, T* y, int64_t rows, int64_t n, double e
         for (int64_t j = 0; j < n; j++) {
             sum_sq += static_cast<double>(xr[j]) * xr[j];
         }
-        const T inv_rms = static_cast<T>(1.0 / std::sqrt(sum_sq / n + eps));
+        const double inv_rms = 1.0 / std::sqrt(sum_sq / n + eps);
 
         for (int64_t j = 0; j < n; j++) {
-            yr[j] = w[j] * xr[j] * inv_rms;
+            yr[j] = static_cast<T>(static_cast<double>(w[j]) * xr[j] * inv_rms);
         }
     }
 }
@@ -87,7 +86,7 @@ at::Tensor rmsnorm_cpu(const at::Tensor& x, const at::Tensor& weight, double eps
 
     const int64_t n = xc.size(-1);
     const int64_t rows = n == 0 ? 0 : xc.numel() / n;
-    AT_DISPATCH_FLOATING_TYPES(xc.scalar_type(), "rmsnorm", [&] {
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, xc.scalar_type(), "rmsnorm", [&] {
         rmsnorm_fwd<scalar_t>(xc.const_data_ptr<scalar_t>(), wc.const_data_ptr<scalar_t>(),
                               out.mutable_data_ptr<scalar_t>(), rows, n, eps);
     });
@@ -115,19 +114,19 @@ std::tuple<at::Tensor, at::Tensor> rmsnorm_backward_cpu (const at::Tensor& grad_
     at::Tensor xc = x.contiguous();
     at::Tensor weightc = weight.contiguous();
     at::Tensor grad_x = at::empty_like(xc);
-    // Every row adds into grad_weight, so it must start at zero.
-    at::Tensor grad_weight = at::zeros_like(weightc);
+    // Every row adds into grad_weight in double precision, so it must start at zero and not lose precision for half types.
+    at::Tensor grad_weight = at::zeros_like(weightc, weightc.options().dtype(at::kDouble));
 
     const int64_t n = xc.size(-1);
     const int64_t rows = n == 0 ? 0 : xc.numel() / n;
 
-    AT_DISPATCH_FLOATING_TYPES(xc.scalar_type(), "rmsnorm", [&] {
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, xc.scalar_type(), "rmsnorm", [&] {
         rmsnorm_bwd<scalar_t>(grad_outc.const_data_ptr<scalar_t>(), xc.const_data_ptr<scalar_t>(),
                               weightc.const_data_ptr<scalar_t>(), grad_x.mutable_data_ptr<scalar_t>(),
-                              grad_weight.mutable_data_ptr<scalar_t>(), rows, n, eps);
+                              grad_weight.mutable_data_ptr<double>(), rows, n, eps);
     });
 
-    return {grad_x, grad_weight};
+    return {grad_x, grad_weight.to(xc.scalar_type())};
 }
 
 // The backward is a separate op so torch.compile can trace it.
