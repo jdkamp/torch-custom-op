@@ -24,11 +24,12 @@ SHAPES = [
     (4096, 128),
 ]
 DTYPES = [torch.float32, torch.float64]
+HALF_DTYPES = [torch.float16, torch.bfloat16]
 
 
 # Forward correctness
 
-@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("dtype", DTYPES + HALF_DTYPES)
 @pytest.mark.parametrize("shape", SHAPES)
 def test_matches_cpu(shape, dtype):
     x = torch.randn(shape, dtype=dtype)
@@ -68,7 +69,7 @@ def test_weight_on_other_device():
 
 # Backward correctness
 
-@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("dtype", DTYPES + HALF_DTYPES)
 @pytest.mark.parametrize("shape", SHAPES)
 def test_backward_matches_cpu(shape, dtype):
     g = torch.randn(shape, dtype=dtype)
@@ -114,7 +115,7 @@ def test_backward_invalid_inputs(g, x, w, match):
 
 # opcheck
 
-@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("dtype", DTYPES + HALF_DTYPES)
 @pytest.mark.parametrize("shape", [(8,), (3, 8), (2, 4, 16)])
 @pytest.mark.parametrize("requires_grad", [False, True])
 def test_opcheck_forward(shape, dtype, requires_grad):
@@ -123,7 +124,7 @@ def test_opcheck_forward(shape, dtype, requires_grad):
     torch.library.opcheck(op.default, (x, w, EPS))
 
 
-@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("dtype", DTYPES + HALF_DTYPES)
 @pytest.mark.parametrize("shape", [(8,), (3, 8), (2, 4, 16)])
 def test_opcheck_backward(shape, dtype):
     g = torch.randn(shape, dtype=dtype, device="cuda")
