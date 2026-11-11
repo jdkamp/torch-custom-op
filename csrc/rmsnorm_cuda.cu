@@ -272,12 +272,104 @@ __global__ void rmsnorm_bwd_cached_kernel(const T* g, const T* x, const T* w, T*
     }
 }
 
+template <typename T, int kElemsPerThread>
+__global__ void rmsnorm_bwd_vec_kernel(const T* g, const T* x, const T* w, T* gx, at::opmath_type<T>* gw_partial,
+                                       int64_t rows, int64_t n, at::opmath_type<T> eps) {
+    using acc_t = at::opmath_type<T>;
+    
+    constexpr int kVecSize = kVecBytes / sizeof(T);
+    constexpr int kVecsPerThread = kElemsPerThread / kVecSize;
+    static_assert(kElemsPerThread % kVecSize == 0, "a thread must hold whole vectors");
+    
+    __shared__ acc_t partial[kMaxWarps];
+    
+    // w is the same for every row, so load it once per block.
+    const Vec<T>* wr = reinterpret_cast<const Vec<T>*>(w);
+    acc_t wv[kElemsPerThread];
+    acc_t gw_acc[kElemsPerThread];
+    #pragma unroll
+    for (int m = 0; m < kVecsPerThread; m++) {
+        int64_t v = threadIdx.x + m * blockDim.x;
+        Vec<T> wvec = v * kVecSize < n ? wr[v] : Vec<T>{};
+        #pragma unroll
+        for (int i = 0; i < kVecSize; i++) {
+            int k = m * kVecSize + i;
+            wv[k] = static_cast<acc_t>(wvec.val[i]);
+            gw_acc[k] = 0;
+        }
+    }
+    
+    for (int64_t row = blockIdx.x; row < rows; row += gridDim.x) {
+        const Vec<T>* gr = reinterpret_cast<const Vec<T>*>(g + row * n);
+        const Vec<T>* xr = reinterpret_cast<const Vec<T>*>(x + row * n);
+        Vec<T>* gxr = reinterpret_cast<Vec<T>*>(gx + row * n);
+        
+        // Pass 1: load x and g once and recompute inv = 1 / rms.
+        acc_t xv[kElemsPerThread];
+        acc_t gv[kElemsPerThread];
+        acc_t s = 0;
+        #pragma unroll
+        for (int m = 0; m < kVecsPerThread; m++) {
+            int64_t v = threadIdx.x + m * blockDim.x;
+            Vec<T> grvec = v * kVecSize < n ? gr[v] : Vec<T>{};
+            Vec<T> xrvec = v * kVecSize < n ? xr[v] : Vec<T>{};
+            #pragma unroll
+            for (int i = 0; i < kVecSize; i++) {
+                int k = m * kVecSize + i;
+                xv[k] = static_cast<acc_t>(xrvec.val[i]);
+                gv[k] = static_cast<acc_t>(grvec.val[i]);
+                s += xv[k] * xv[k];
+            }
+        }
+        acc_t inv = rsqrt(block_sum(s, partial) / n + eps);
+        
+        // Pass 2: accumulate grad_weight and the coupling sum.
+        acc_t d = 0;
+        #pragma unroll
+        for (int k = 0; k < kElemsPerThread; k++) {
+            acc_t xhat = xv[k] * inv;
+            d += wv[k] * gv[k] * xhat;
+            gw_acc[k] += gv[k] * xhat;
+        }
+        acc_t dot = block_sum(d, partial);
+        
+        // Pass 3: grad_x, from registers.
+        #pragma unroll
+        for (int m = 0; m < kVecsPerThread; m++) {
+            int64_t v = threadIdx.x + m * blockDim.x;
+            if (v * kVecSize < n) {
+                Vec<T> gxvec;
+                #pragma unroll
+                for (int i = 0; i < kVecSize; i++) {
+                    int k = m * kVecSize + i;
+                    acc_t xhat = xv[k] * inv;
+                    gxvec.val[i] = static_cast<T>(inv * (wv[k] * gv[k] - xhat * dot / n));
+                }
+                gxr[v] = gxvec;     // one 16-byte store
+            }
+        }
+    }
+    
+    // One row of partial grad_weight sums per block.
+    #pragma unroll
+    for (int m = 0; m < kVecsPerThread; m++) {
+        int64_t v = threadIdx.x + m * blockDim.x;
+        #pragma unroll
+        for (int i = 0; i < kVecSize; i++) {
+            int64_t j = v * kVecSize + i;
+            if (j < n) {
+                gw_partial[blockIdx.x * n + j] = gw_acc[m * kVecSize + i];
+            }
+        }
+    }
+}
+
 int threads_per_row(int64_t n) {
     int64_t threads = (n + kElemsPerThread - 1) / kElemsPerThread;
     threads = (threads + kWarpSize - 1) / kWarpSize * kWarpSize;
     return static_cast<int>(std::clamp<int64_t>(threads, kWarpSize, kMaxThreads));
 }
-
+    
 // Largest block size the kernel can be launched with. A kernel that uses many
 // registers per thread can't use the full 1024 threads.
 template <typename Kernel>
@@ -287,7 +379,7 @@ int max_threads_per_block(Kernel kernel) {
     return attr.maxThreadsPerBlock;
 }
 
-// Trze if p can b accessed as Vec, i.e. it is aligned to kVecBytes.
+// True if p can be accessed as Vec, i.e. it is aligned to kVecBytes.
 bool is_vec_aligned(const void* p) {
     return reinterpret_cast<uintptr_t>(p) % kVecBytes == 0;
 }
@@ -321,7 +413,7 @@ at::Tensor rmsnorm_cuda(const at::Tensor& x, const at::Tensor& weight, double ep
             auto vec_kernel = rmsnorm_fwd_vec_kernel<scalar_t, kElemsPerThread>;
             const int vec_size = kVecBytes / sizeof(scalar_t);
 
-            // The vectorized kernel also needs whoöe vectors per row and aligned pointers.
+            // The vectorized kernel also needs whole vectors per row and aligned pointers.
             const bool vectorized = n <= static_cast<int64_t>(kElemsPerThread) * threads && 
                         threads <= max_threads_per_block(vec_kernel) &&
                         n % vec_size == 0 &&
@@ -396,13 +488,45 @@ std::tuple<at::Tensor, at::Tensor> rmsnorm_backward_cuda(const at::Tensor& grad_
     AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, xc.scalar_type(), "rmsnorm_backward", [&] {
             auto stream = at::cuda::getCurrentCUDAStream();
             auto cached_kernel = rmsnorm_bwd_cached_kernel<scalar_t, kElemsPerThread>;
+            auto vec_kernel = rmsnorm_bwd_vec_kernel<scalar_t, kElemsPerThread>;
+            const int vec_size = kVecBytes / sizeof(scalar_t);
+
+            // The vectorized kernel needs whole vectors per row and aligned pointers.
+            const bool vectorized = n <= static_cast<int64_t>(kElemsPerThread) * threads &&
+                        threads <= max_threads_per_block(vec_kernel) &&
+                        n % vec_size == 0 &&
+                        is_vec_aligned(gc.const_data_ptr<scalar_t>()) &&
+                        is_vec_aligned(xc.const_data_ptr<scalar_t>()) &&
+                        is_vec_aligned(wc.const_data_ptr<scalar_t>()) &&
+                        is_vec_aligned(grad_x.mutable_data_ptr<scalar_t>()) &&
+                        std::getenv("RMSNORM_NO_VEC") == nullptr;
 
             // The cached kernel needs the whole row in registers, and a block
             // small enough for its register usage.
             const bool cached = n <= static_cast<int64_t>(kElemsPerThread) * threads &&
                                 threads <= max_threads_per_block(cached_kernel);
 
-            if (cached) {
+            if (vectorized) {
+                // As many blocks as fit on the GPU at once, given this kernel's
+                // register and thread usage, each block loops over many rows.
+                const int sm_count = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+                int blocks_per_sm = 0;
+                C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                    &blocks_per_sm, vec_kernel, threads, 0));
+                TORCH_INTERNAL_ASSERT(blocks_per_sm > 0,
+                                      "rmsnorm_backward: cached kernel does not fit on an SM with ",
+                                      threads, " threads");
+                const int64_t blocks = std::min<int64_t>(
+                    rows, static_cast<int64_t>(sm_count) * blocks_per_sm);
+                gw_partial = at::empty({blocks, n}, acc_options);
+
+                vec_kernel<<<blocks, threads, 0, stream>>>(
+                    gc.const_data_ptr<scalar_t>(), xc.const_data_ptr<scalar_t>(),
+                    wc.const_data_ptr<scalar_t>(), grad_x.mutable_data_ptr<scalar_t>(),
+                    gw_partial.mutable_data_ptr<at::opmath_type<scalar_t>>(),
+                    rows, n, static_cast<at::opmath_type<scalar_t>>(eps));
+            }
+            else if (cached) {
                 // As many blocks as fit on the GPU at once, given this kernel's
                 // register and thread usage, each block loops over many rows.
                 const int sm_count = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
