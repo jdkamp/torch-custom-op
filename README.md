@@ -24,7 +24,7 @@ y = torch.ops.rmsnorm.rmsnorm(x, weight, 1e-6)
 
 - `rmsnorm` and `rmsnorm_backward` are dispatcher ops with CPU and CUDA kernels.
 - The CUDA kernels size the block to the row: each thread handles 8 elements, so a row of `n` elements gets `ceil(n / 8)` threads, rounded up to a multiple of 32 and capped at 1024. Row sums are reduced with warp shuffles, then across warps with shared memory.
-- Rows longer than 8192 elements, or blocks too large for a kernel's register usage, fall back to a kernel with 256 threads per row that reads the row from memory in each pass.
+- The kernels fall back to 256 threads per row, reading the row from memory in each pass, if the row is longer than 8192 elements, the block is too large for the kernel's register usage, `n` is not a multiple of the vector width (16 bytes), or a tensor is not 16-byte aligned.
 - Autograd is registered with `register_autograd`. The backward is its own dispatcher op, so `torch.compile` can trace it.
 - Both ops have fake kernels. `opcheck` passes for both.
 - Supported dtypes are float32, float64, float16 and bfloat16. For float16 and bfloat16 the kernels load and store in the input dtype but compute in higher precision (float32 on CUDA, float64 on CPU).
@@ -39,25 +39,26 @@ Reproduce with `python bench/bench.py`. `x.clone()` reads and writes the input o
 | | Forward | Forward + backward |
 |---|---|---|
 | `x.clone()` (reference)   | 1.15 ms     | |
-| Naive eager PyTorch       | 3.90 ms     | 16.74 ms |
+| Naive eager PyTorch       | 3.90 ms     | 16.75 ms |
 | `F.rms_norm`              | 1.64 ms     | 5.42 ms |
 | `torch.compile` (naive)   | 1.14 ms     | 2.87 ms |
-| **This op**               | **1.14 ms** | **2.75 ms** |
+| **This op**               | **1.14 ms** | **2.81 ms** |
 
 **float16**
 
 | | Forward | Forward + backward |
 |---|---|---|
 | `x.clone()` (reference)   | 0.57 ms     | |
-| Naive eager PyTorch       | 2.24 ms     | 8.77 ms |
-| `F.rms_norm`              | 0.74 ms     | 2.70 ms |
-| `torch.compile` (naive)   | 0.54 ms     | 1.45 ms |
-| **This op**               | **0.65 ms** | **1.79 ms** |
+| Naive eager PyTorch       | 2.22 ms     | 8.73 ms |
+| `F.rms_norm`              | 0.75 ms     | 2.70 ms |
+| `torch.compile` (naive)   | 0.55 ms     | 1.45 ms |
+| **This op**               | **0.55 ms** | **1.37 ms** |
 
 The runtime was improved by the following measures:
 
 - Register caching: each thread keeps its slice of the row in registers, so every input is read from memory only once.
 - Two-stage reduction for `grad_weight`: the backward launches as many blocks as fit on the GPU at once. Each block sums many rows in registers and writes one row of partial sums, which are then summed into the final gradient.
+- Vectorized memory access: each thread loads and stores 16 bytes at a time instead of one element. This made float16 faster and left the float32 forward unchanged, since it was already at the bandwidth limit.
 
 ## Tests
 
@@ -67,8 +68,3 @@ python -m pytest tests
 ```
 
 `tests/test_cuda.py` is skipped without a CUDA environment.
-
-## Limitations
-
-- In float16 the op is slower than `torch.compile`. The kernels load one element per thread at a time, which likely uses memory bandwidth less well for 2-byte types. Vectorized loads are not implemented yet.
-- The backward always computes both gradients; unneeded ones are not skipped.
