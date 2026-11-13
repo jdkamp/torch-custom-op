@@ -84,6 +84,39 @@ def test_backward_matches_cpu(shape, dtype):
     torch.testing.assert_close(gw.cpu(), expected_gw, **gw_tol)
 
 
+def unaligned_cuda_copy(t):
+    """Contiguous CUDA copy of t whose data is not 16-byte aligned."""
+    base = torch.empty(t.numel() + 1, dtype=t.dtype, device="cuda")
+    out = base[1:].view(t.shape)  # starts one element into the storage
+    out.copy_(t)
+    assert out.is_contiguous() and out.data_ptr() % 16 != 0
+    return out
+
+
+# The cached kernels need 16-byte aligned pointers. Each unaligned input must
+# take the fallback kernel and still give the right result.
+@pytest.mark.parametrize("dtype", DTYPES + HALF_DTYPES)
+@pytest.mark.parametrize("which", ["x", "w", "g"])
+def test_unaligned_pointer(which, dtype):
+    cpu = {
+        "x": torch.randn(4, 512, dtype=dtype),
+        "w": torch.randn(512, dtype=dtype),
+        "g": torch.randn(4, 512, dtype=dtype),
+    }
+    gpu = {
+        name: unaligned_cuda_copy(t) if name == which else t.cuda()
+        for name, t in cpu.items()
+    }
+
+    expected = op(cpu["x"], cpu["w"], EPS)
+    torch.testing.assert_close(op(gpu["x"], gpu["w"], EPS).cpu(), expected)
+
+    expected_gx, expected_gw = op_backward(cpu["g"], cpu["x"], cpu["w"], EPS)
+    gx, gw = op_backward(gpu["g"], gpu["x"], gpu["w"], EPS)
+    torch.testing.assert_close(gx.cpu(), expected_gx)
+    torch.testing.assert_close(gw.cpu(), expected_gw)
+
+
 @pytest.mark.parametrize("shape", [(8,), (3, 8), (2, 4, 16)])
 def test_gradcheck(shape):
     x = torch.randn(shape, dtype=torch.float64, device="cuda", requires_grad=True)
